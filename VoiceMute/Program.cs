@@ -75,11 +75,18 @@ class Program
     static IntPtr _hookId = IntPtr.Zero;
     static LowLevelKeyboardProc _proc = HookCallback; // prevent GC
     static Timer? _muteTimer;
+    static Timer? _unmuteTimer;
+    static CancellationTokenSource? _fadeCts;
     static bool _isMuted;
     static bool _spaceHeld;
+    static float _savedVolume;
     static MMDeviceEnumerator? _deviceEnumerator;
     static readonly object _lock = new();
-    static int _holdDelayMs = 1000;
+    static int _holdDelayMs = 200;
+    static int _unmuteDelayMs = 0;
+    static int _fadeOutMs = 100;
+    static int _fadeInMs = 250;
+    static int _fadeSteps = 10;
     static readonly HashSet<string> _terminalProcessNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "WindowsTerminal",
@@ -98,26 +105,59 @@ class Program
 
     static void Main(string[] args)
     {
-        // Parse optional delay argument
-        if (args.Length > 0 && int.TryParse(args[0], out var delayMs))
+        bool daemonMode = args.Contains("-d", StringComparer.OrdinalIgnoreCase);
+        bool backgroundMode = args.Contains("--background", StringComparer.OrdinalIgnoreCase);
+        bool killMode = args.Contains("--kill", StringComparer.OrdinalIgnoreCase);
+
+        // --kill: stop any running instance
+        if (killMode)
         {
-            _holdDelayMs = delayMs;
+            KillExisting();
+            Console.WriteLine("VoiceMute stopped.");
+            return;
         }
 
-        Console.WriteLine("=== VoiceMute ===");
-        Console.WriteLine($"Mutes speakers when Space is held for {_holdDelayMs}ms in a terminal window.");
-        Console.WriteLine("Press Ctrl+C to exit.");
-        Console.WriteLine();
+        // -d: kill existing, then respawn self as hidden background process
+        if (daemonMode)
+        {
+            KillExisting();
+
+            var exe = Environment.ProcessPath!;
+            var psi = new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = "--background",
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                UseShellExecute = false,
+            };
+
+            var proc = Process.Start(psi);
+            Console.WriteLine($"VoiceMute running in background (PID {proc?.Id})");
+            return;
+        }
+
+        // Foreground or --background: run the actual hook loop
+        if (!backgroundMode)
+        {
+            Console.WriteLine("=== VoiceMute ===");
+            Console.WriteLine($"Hold delay: {_holdDelayMs}ms | Fade out: {_fadeOutMs}ms | Fade in: {_fadeInMs}ms");
+            Console.WriteLine("Usage:");
+            Console.WriteLine("  VoiceMute        Run in foreground (Ctrl+C to stop)");
+            Console.WriteLine("  VoiceMute -d     Run as background daemon");
+            Console.WriteLine("  VoiceMute --kill Stop background daemon");
+            Console.WriteLine();
+        }
 
         _deviceEnumerator = new MMDeviceEnumerator();
 
-        // Get the message loop thread ID so we can post WM_QUIT to it
         var messageThreadId = GetCurrentThreadId();
 
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
-            Unmute();
+            _fadeCts?.Cancel();
+            RestoreVolume();
             PostThreadMessage(messageThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         };
 
@@ -131,7 +171,8 @@ class Program
             return;
         }
 
-        Console.WriteLine("Keyboard hook installed. Listening...");
+        if (!backgroundMode)
+            Console.WriteLine("Keyboard hook installed. Listening...");
 
         // Win32 message loop (required for low-level hooks)
         while (GetMessage(out var msg, IntPtr.Zero, 0, 0))
@@ -143,10 +184,30 @@ class Program
         // Cleanup
         UnhookWindowsHookEx(_hookId);
         _muteTimer?.Dispose();
+        _fadeCts?.Cancel();
+        RestoreVolume();
         _deviceEnumerator?.Dispose();
-        Unmute();
+    }
 
-        Console.WriteLine("Exited cleanly.");
+    static void KillExisting()
+    {
+        var currentPid = Environment.ProcessId;
+        var name = Process.GetCurrentProcess().ProcessName;
+
+        foreach (var proc in Process.GetProcessesByName(name))
+        {
+            if (proc.Id != currentPid)
+            {
+                try
+                {
+                    proc.Kill();
+                    proc.WaitForExit(3000);
+                    Console.WriteLine($"Killed existing VoiceMute (PID {proc.Id})");
+                }
+                catch { }
+            }
+            proc.Dispose();
+        }
     }
 
     static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -207,7 +268,16 @@ class Program
 
             if (_isMuted)
             {
-                Unmute();
+                // Delay unmute so audio doesn't blast back immediately
+                _unmuteTimer?.Dispose();
+                _unmuteTimer = new Timer(_ =>
+                {
+                    lock (_lock)
+                    {
+                        _unmuteTimer = null;
+                        Unmute();
+                    }
+                }, null, _unmuteDelayMs, Timeout.Infinite);
             }
         }
     }
@@ -216,34 +286,84 @@ class Program
     {
         if (_isMuted) return;
 
-        try
+        // Cancel any in-progress fade
+        _fadeCts?.Cancel();
+        _fadeCts = new CancellationTokenSource();
+        var ct = _fadeCts.Token;
+
+        _isMuted = true;
+
+        Task.Run(async () =>
         {
-            using var device = _deviceEnumerator!.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-            device.AudioEndpointVolume.Mute = true;
-            _isMuted = true;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] MUTED - Voice recording detected");
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"Failed to mute: {ex.Message}");
-        }
+            try
+            {
+                using var device = _deviceEnumerator!.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                var vol = device.AudioEndpointVolume;
+                _savedVolume = vol.MasterVolumeLevelScalar;
+
+                var stepDelay = _fadeOutMs / _fadeSteps;
+
+                // Fade out
+                for (int i = _fadeSteps; i >= 0; i--)
+                {
+                    if (ct.IsCancellationRequested) return;
+                    vol.MasterVolumeLevelScalar = _savedVolume * ((float)i / _fadeSteps);
+                    await Task.Delay(stepDelay, ct);
+                }
+
+                vol.MasterVolumeLevelScalar = 0f;
+            }
+            catch (OperationCanceledException) { }
+            catch { }
+        });
     }
 
     static void Unmute()
     {
         if (!_isMuted) return;
 
+        // Cancel any in-progress fade
+        _fadeCts?.Cancel();
+        _fadeCts = new CancellationTokenSource();
+        var ct = _fadeCts.Token;
+
+        _isMuted = false;
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                using var device = _deviceEnumerator!.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                var vol = device.AudioEndpointVolume;
+                var targetVolume = _savedVolume > 0 ? _savedVolume : 1.0f;
+
+                var stepDelay = _fadeInMs / _fadeSteps;
+
+                // Fade in
+                for (int i = 0; i <= _fadeSteps; i++)
+                {
+                    if (ct.IsCancellationRequested) return;
+                    vol.MasterVolumeLevelScalar = targetVolume * ((float)i / _fadeSteps);
+                    await Task.Delay(stepDelay, ct);
+                }
+
+                vol.MasterVolumeLevelScalar = targetVolume;
+            }
+            catch (OperationCanceledException) { }
+            catch { }
+        });
+    }
+
+    static void RestoreVolume()
+    {
         try
         {
             using var device = _deviceEnumerator!.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-            device.AudioEndpointVolume.Mute = false;
+            if (_savedVolume > 0)
+                device.AudioEndpointVolume.MasterVolumeLevelScalar = _savedVolume;
             _isMuted = false;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] UNMUTED - Voice recording ended");
         }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"Failed to unmute: {ex.Message}");
-        }
+        catch { }
     }
 
     static bool IsTerminalFocused()
