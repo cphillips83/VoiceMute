@@ -161,9 +161,7 @@ class Program
             PostThreadMessage(messageThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         };
 
-        using var process = Process.GetCurrentProcess();
-        using var module = process.MainModule!;
-        _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(module.ModuleName), 0);
+        _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(null), 0);
 
         if (_hookId == IntPtr.Zero)
         {
