@@ -385,14 +385,25 @@ class Program
         catch { return false; }
     }
 
+    static void KillExistingWhisper()
+    {
+        foreach (var proc in Process.GetProcessesByName("whisper-server"))
+        {
+            try
+            {
+                proc.Kill();
+                proc.WaitForExit(3000);
+                Console.WriteLine($"[Whisper] Killed existing whisper-server (PID {proc.Id})");
+            }
+            catch { }
+            proc.Dispose();
+        }
+    }
+
     static bool StartWhisperServer()
     {
-        // Check if already running
-        if (IsWhisperRunning())
-        {
-            Console.WriteLine("[Whisper] Already running on port 2022");
-            return true;
-        }
+        // Kill any orphaned whisper-server so we own the process
+        KillExistingWhisper();
 
         var serverPath = FindWhisperServer();
         if (serverPath == null)
