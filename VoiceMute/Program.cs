@@ -142,6 +142,9 @@ class Program
     static string _whisperUrl = "http://127.0.0.1:2022/inference";
     static string? _whisperModel;
     static Process? _whisperProcess;
+    static CancellationTokenSource? _broadcastCts;
+    const int DISCOVERY_PORT = 5766;
+    const string DISCOVERY_MAGIC = "VOICEMUTE_WHISPER_DISCOVER";
 
     static readonly HashSet<string> _terminalProcessNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -170,6 +173,10 @@ class Program
         if (modelIdx >= 0 && modelIdx + 1 < args.Length)
             _whisperModel = args[modelIdx + 1];
 
+        var urlIdx = Array.FindIndex(args, a => a.Equals("--whisper-url", StringComparison.OrdinalIgnoreCase));
+        if (urlIdx >= 0 && urlIdx + 1 < args.Length)
+            _whisperUrl = args[urlIdx + 1];
+
         if (killMode)
         {
             KillExisting();
@@ -189,6 +196,7 @@ class Program
                     "--background",
                     _sttEnabled ? "--stt" : null,
                     _whisperModel != null ? $"--model {_whisperModel}" : null,
+                    _whisperUrl != "http://127.0.0.1:2022/inference" ? $"--whisper-url {_whisperUrl}" : null,
                 }.Where(x => x != null)),
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden,
@@ -210,9 +218,10 @@ class Program
             Console.WriteLine("Usage:");
             Console.WriteLine("  VoiceMute                    Run in foreground, mute only (Ctrl+C to stop)");
             Console.WriteLine("  VoiceMute --stt              Enable speech-to-text (auto-starts Whisper)");
-            Console.WriteLine("  VoiceMute --stt --model base Use a specific Whisper model (base/small/large-v2/etc)");
-            Console.WriteLine("  VoiceMute -d [--stt]         Run as background daemon");
-            Console.WriteLine("  VoiceMute --kill             Stop background daemon");
+            Console.WriteLine("  VoiceMute --stt --model base       Use a specific Whisper model");
+            Console.WriteLine("  VoiceMute --stt --whisper-url URL   Use a remote Whisper server");
+            Console.WriteLine("  VoiceMute -d [--stt]               Run as background daemon");
+            Console.WriteLine("  VoiceMute --kill                   Stop background daemon");
             Console.WriteLine();
         }
 
@@ -228,7 +237,32 @@ class Program
 
         if (_sttEnabled)
         {
-            if (!StartWhisperServer())
+            bool whisperReady = false;
+
+            if (_whisperUrl != "http://127.0.0.1:2022/inference")
+            {
+                // Explicit URL provided — use it directly
+                Console.WriteLine($"[Whisper] Using: {_whisperUrl}");
+                whisperReady = true;
+            }
+            else if (StartWhisperServer())
+            {
+                // Local whisper started — broadcast its location for other machines
+                whisperReady = true;
+                StartBroadcasting(_whisperUrl);
+            }
+            else
+            {
+                // No local whisper — try to find one on the network
+                var discovered = DiscoverWhisper();
+                if (discovered != null)
+                {
+                    _whisperUrl = discovered;
+                    whisperReady = true;
+                }
+            }
+
+            if (!whisperReady)
             {
                 Console.Error.WriteLine("STT requires Whisper. Falling back to mute-only mode.");
                 _sttEnabled = false;
@@ -243,6 +277,7 @@ class Program
             _fadeCts?.Cancel();
             StopRecording();
             RestoreVolume();
+            StopBroadcasting();
             StopWhisperServer();
             PostThreadMessage(messageThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         };
@@ -507,6 +542,69 @@ class Program
             _whisperProcess.Dispose();
             _whisperProcess = null;
         }
+    }
+
+    // === UDP Discovery ===
+
+    static void StartBroadcasting(string whisperUrl)
+    {
+        _broadcastCts = new CancellationTokenSource();
+        var ct = _broadcastCts.Token;
+
+        Task.Run(async () =>
+        {
+            using var udp = new System.Net.Sockets.UdpClient();
+            udp.EnableBroadcast = true;
+            var payload = System.Text.Encoding.UTF8.GetBytes($"{DISCOVERY_MAGIC}|{whisperUrl}");
+            var endpoint = new System.Net.IPEndPoint(System.Net.IPAddress.Broadcast, DISCOVERY_PORT);
+
+            Console.WriteLine($"[Discovery] Broadcasting whisper at {whisperUrl} on UDP port {DISCOVERY_PORT}");
+
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    await udp.SendAsync(payload, payload.Length, endpoint);
+                    await Task.Delay(3000, ct);
+                }
+                catch (OperationCanceledException) { break; }
+                catch { }
+            }
+        }, ct);
+    }
+
+    static void StopBroadcasting()
+    {
+        _broadcastCts?.Cancel();
+        _broadcastCts = null;
+    }
+
+    static string? DiscoverWhisper(int timeoutMs = 5000)
+    {
+        Console.Write("[Discovery] Searching for whisper server on network");
+
+        try
+        {
+            using var udp = new System.Net.Sockets.UdpClient(DISCOVERY_PORT);
+            udp.Client.ReceiveTimeout = timeoutMs;
+
+            var remote = new System.Net.IPEndPoint(System.Net.IPAddress.Any, 0);
+            var data = udp.Receive(ref remote);
+            var msg = System.Text.Encoding.UTF8.GetString(data);
+
+            if (msg.StartsWith(DISCOVERY_MAGIC + "|"))
+            {
+                var url = msg.Substring(DISCOVERY_MAGIC.Length + 1);
+                Console.WriteLine($" found: {url}");
+                return url;
+            }
+        }
+        catch (System.Net.Sockets.SocketException)
+        {
+            Console.WriteLine(" not found.");
+        }
+
+        return null;
     }
 
     static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
