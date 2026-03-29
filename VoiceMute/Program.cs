@@ -216,6 +216,14 @@ class Program
             Console.WriteLine();
         }
 
+        // Single instance check — prevent duplicate processes from double-typing
+        using var mutex = new Mutex(true, "Global\\VoiceMute_SingleInstance", out bool isNew);
+        if (!isNew)
+        {
+            Console.Error.WriteLine("VoiceMute is already running. Use --kill to stop the existing instance first.");
+            return;
+        }
+
         _deviceEnumerator = new MMDeviceEnumerator();
 
         if (_sttEnabled)
