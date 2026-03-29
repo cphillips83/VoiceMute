@@ -527,6 +527,26 @@ class Program
             if (_keyHeld) return;
             _keyHeld = true;
 
+            // If previous recording is stuck, abort it
+            if (_isRecording)
+            {
+                Console.WriteLine("[STT] Aborting stuck recording");
+                try { _capture?.StopRecording(); } catch { }
+                _capture?.Dispose();
+                _capture = null;
+                _audioBuffer?.Dispose();
+                _audioBuffer = null;
+                _captureFormat = null;
+                _isRecording = false;
+            }
+
+            // If mute is stuck, force unmute
+            if (_isMuted)
+            {
+                Console.WriteLine("[Mute] Resetting stuck mute");
+                RestoreVolume();
+            }
+
             // Start timer — if key still held after delay, mute + record
             _holdTimer?.Dispose();
             _holdTimer = new Timer(_ =>
