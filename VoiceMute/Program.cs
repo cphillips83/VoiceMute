@@ -247,9 +247,14 @@ class Program
             }
             else if (StartWhisperServer())
             {
-                // Local whisper started — broadcast its location for other machines
+                // Local whisper started — broadcast its LAN address for other machines
                 whisperReady = true;
-                StartBroadcasting(_whisperUrl);
+                var lanIp = GetLanIp();
+                if (lanIp != null)
+                {
+                    var lanUrl = $"http://{lanIp}:2022/inference";
+                    StartBroadcasting(lanUrl);
+                }
             }
             else
             {
@@ -470,7 +475,7 @@ class Program
         var psi = new ProcessStartInfo
         {
             FileName = serverPath,
-            Arguments = $"--model \"{modelPath}\" --host 127.0.0.1 --port 2022 --convert",
+            Arguments = $"--model \"{modelPath}\" --host 0.0.0.0 --port 2022 --convert",
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
@@ -545,6 +550,20 @@ class Program
     }
 
     // === UDP Discovery ===
+
+    static string? GetLanIp()
+    {
+        try
+        {
+            using var socket = new System.Net.Sockets.Socket(
+                System.Net.Sockets.AddressFamily.InterNetwork,
+                System.Net.Sockets.SocketType.Dgram, 0);
+            socket.Connect("8.8.8.8", 65530);
+            var ep = socket.LocalEndPoint as System.Net.IPEndPoint;
+            return ep?.Address.ToString();
+        }
+        catch { return null; }
+    }
 
     static void StartBroadcasting(string whisperUrl)
     {
