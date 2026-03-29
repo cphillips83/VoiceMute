@@ -140,6 +140,8 @@ class Program
     static Timer? _holdTimer;
     static readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(30) };
     static string _whisperUrl = "http://127.0.0.1:2022/inference";
+    static string? _whisperModel;
+    static Process? _whisperProcess;
 
     static readonly HashSet<string> _terminalProcessNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -164,6 +166,10 @@ class Program
         bool killMode = args.Contains("--kill", StringComparer.OrdinalIgnoreCase);
         _sttEnabled = args.Contains("--stt", StringComparer.OrdinalIgnoreCase);
 
+        var modelIdx = Array.FindIndex(args, a => a.Equals("--model", StringComparison.OrdinalIgnoreCase));
+        if (modelIdx >= 0 && modelIdx + 1 < args.Length)
+            _whisperModel = args[modelIdx + 1];
+
         if (killMode)
         {
             KillExisting();
@@ -179,7 +185,11 @@ class Program
             var psi = new ProcessStartInfo
             {
                 FileName = exe,
-                Arguments = _sttEnabled ? "--background --stt" : "--background",
+                Arguments = string.Join(" ", new[] {
+                    "--background",
+                    _sttEnabled ? "--stt" : null,
+                    _whisperModel != null ? $"--model {_whisperModel}" : null,
+                }.Where(x => x != null)),
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden,
                 UseShellExecute = false,
@@ -198,15 +208,24 @@ class Program
             if (_sttEnabled)
                 Console.WriteLine($"Whisper: {_whisperUrl}");
             Console.WriteLine("Usage:");
-            Console.WriteLine("  VoiceMute             Run in foreground (Ctrl+C to stop)");
-            Console.WriteLine("  VoiceMute --stt       Enable speech-to-text (requires Whisper on port 2022)");
-            Console.WriteLine("  VoiceMute -d          Run as background daemon");
-            Console.WriteLine("  VoiceMute -d --stt    Daemon with speech-to-text");
-            Console.WriteLine("  VoiceMute --kill      Stop background daemon");
+            Console.WriteLine("  VoiceMute                    Run in foreground, mute only (Ctrl+C to stop)");
+            Console.WriteLine("  VoiceMute --stt              Enable speech-to-text (auto-starts Whisper)");
+            Console.WriteLine("  VoiceMute --stt --model base Use a specific Whisper model (base/small/large-v2/etc)");
+            Console.WriteLine("  VoiceMute -d [--stt]         Run as background daemon");
+            Console.WriteLine("  VoiceMute --kill             Stop background daemon");
             Console.WriteLine();
         }
 
         _deviceEnumerator = new MMDeviceEnumerator();
+
+        if (_sttEnabled)
+        {
+            if (!StartWhisperServer())
+            {
+                Console.Error.WriteLine("STT requires Whisper. Falling back to mute-only mode.");
+                _sttEnabled = false;
+            }
+        }
 
         var messageThreadId = GetCurrentThreadId();
 
@@ -216,6 +235,7 @@ class Program
             _fadeCts?.Cancel();
             StopRecording();
             RestoreVolume();
+            StopWhisperServer();
             PostThreadMessage(messageThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         };
 
@@ -241,6 +261,7 @@ class Program
         _fadeCts?.Cancel();
         StopRecording();
         RestoreVolume();
+        StopWhisperServer();
         _deviceEnumerator?.Dispose();
     }
 
@@ -262,6 +283,210 @@ class Program
                 catch { }
             }
             proc.Dispose();
+        }
+    }
+
+    static string? FindWhisperServer()
+    {
+        // Check common locations
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var candidates = new[]
+        {
+            Path.Combine(home, "voicemode", "whisper", "CudaRelease", "Release", "whisper-server.exe"),
+            Path.Combine(home, "voicemode", "whisper", "Release", "whisper-server.exe"),
+        };
+
+        foreach (var path in candidates)
+        {
+            if (File.Exists(path)) return path;
+        }
+
+        return null;
+    }
+
+    static string? FindWhisperModel()
+    {
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var modelDir = Path.Combine(home, "voicemode", "whisper");
+
+        // If --model was specified, resolve it
+        if (_whisperModel != null)
+        {
+            // Absolute path
+            if (Path.IsPathRooted(_whisperModel) && File.Exists(_whisperModel))
+                return _whisperModel;
+
+            // Relative to model dir (e.g. "base" or "ggml-base.bin")
+            var name = _whisperModel;
+            if (!name.StartsWith("ggml-")) name = $"ggml-{name}";
+            if (!name.EndsWith(".bin")) name = $"{name}.bin";
+            var path = Path.Combine(modelDir, name);
+            if (File.Exists(path)) return path;
+
+            Console.Error.WriteLine($"[Whisper] Model not found: {_whisperModel} (looked for {path})");
+            return null;
+        }
+
+        if (!Directory.Exists(modelDir)) return null;
+
+        // Prefer larger models
+        var modelPreference = new[] { "ggml-large-v2.bin", "ggml-large-v3.bin", "ggml-small.bin", "ggml-base.bin", "ggml-tiny.en.bin" };
+        foreach (var model in modelPreference)
+        {
+            var resolved = Path.Combine(modelDir, model);
+            if (File.Exists(resolved)) return resolved;
+        }
+
+        // Fall back to any ggml model file
+        return Directory.GetFiles(modelDir, "ggml-*.bin").FirstOrDefault();
+    }
+
+    static string? FindFfmpeg()
+    {
+        // Check if ffmpeg is on PATH
+        try
+        {
+            var psi = new ProcessStartInfo("ffmpeg", "-version")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var p = Process.Start(psi);
+            p?.WaitForExit(2000);
+            if (p?.ExitCode == 0) return null; // already on PATH, no extra dir needed
+        }
+        catch { }
+
+        // Search winget install location
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var wingetDir = Path.Combine(localAppData, "Microsoft", "WinGet", "Packages");
+        if (Directory.Exists(wingetDir))
+        {
+            try
+            {
+                var ffmpegExe = Directory.GetFiles(wingetDir, "ffmpeg.exe", SearchOption.AllDirectories).FirstOrDefault();
+                if (ffmpegExe != null) return Path.GetDirectoryName(ffmpegExe);
+            }
+            catch { }
+        }
+
+        return null;
+    }
+
+    static bool IsWhisperRunning()
+    {
+        try
+        {
+            using var response = _httpClient.GetAsync("http://127.0.0.1:2022/").Result;
+            return true;
+        }
+        catch { return false; }
+    }
+
+    static bool StartWhisperServer()
+    {
+        // Check if already running
+        if (IsWhisperRunning())
+        {
+            Console.WriteLine("[Whisper] Already running on port 2022");
+            return true;
+        }
+
+        var serverPath = FindWhisperServer();
+        if (serverPath == null)
+        {
+            Console.Error.WriteLine("[Whisper] whisper-server.exe not found. Install whisper.cpp to ~/voicemode/whisper/");
+            return false;
+        }
+
+        var modelPath = FindWhisperModel();
+        if (modelPath == null)
+        {
+            Console.Error.WriteLine("[Whisper] No model found. Download a ggml model to ~/voicemode/whisper/");
+            return false;
+        }
+
+        var ffmpegDir = FindFfmpeg();
+
+        Console.WriteLine($"[Whisper] Starting: {Path.GetFileName(serverPath)}");
+        Console.WriteLine($"[Whisper] Model: {Path.GetFileName(modelPath)}");
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = serverPath,
+            Arguments = $"--model \"{modelPath}\" --host 127.0.0.1 --port 2022 --convert",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+
+        if (ffmpegDir != null)
+        {
+            psi.Environment["PATH"] = ffmpegDir + ";" + Environment.GetEnvironmentVariable("PATH");
+        }
+
+        try
+        {
+            _whisperProcess = Process.Start(psi);
+
+            // Log stdout/stderr
+            _whisperProcess!.OutputDataReceived += (_, e) =>
+            {
+                if (!string.IsNullOrEmpty(e.Data))
+                    Console.WriteLine($"[Whisper] {e.Data}");
+            };
+            _whisperProcess.ErrorDataReceived += (_, e) =>
+            {
+                if (!string.IsNullOrEmpty(e.Data))
+                    Console.WriteLine($"[Whisper] {e.Data}");
+            };
+            _whisperProcess.BeginOutputReadLine();
+            _whisperProcess.BeginErrorReadLine();
+
+            // Wait for server to be ready
+            Console.Write("[Whisper] Waiting for server");
+            for (int i = 0; i < 30; i++)
+            {
+                Thread.Sleep(500);
+                if (_whisperProcess.HasExited)
+                {
+                    Console.WriteLine(" FAILED (process exited)");
+                    return false;
+                }
+                if (IsWhisperRunning())
+                {
+                    Console.WriteLine(" ready!");
+                    return true;
+                }
+                Console.Write(".");
+            }
+
+            Console.WriteLine(" TIMEOUT");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Whisper] Failed to start: {ex.Message}");
+            return false;
+        }
+    }
+
+    static void StopWhisperServer()
+    {
+        if (_whisperProcess != null && !_whisperProcess.HasExited)
+        {
+            try
+            {
+                _whisperProcess.Kill();
+                _whisperProcess.WaitForExit(3000);
+                Console.WriteLine("[Whisper] Stopped");
+            }
+            catch { }
+            _whisperProcess.Dispose();
+            _whisperProcess = null;
         }
     }
 
