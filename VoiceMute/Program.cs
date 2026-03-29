@@ -551,14 +551,36 @@ class Program
             _holdTimer?.Dispose();
             _holdTimer = null;
 
-            if (_sttEnabled && _isRecording)
+            // Always reset state on key-up, even if something crashed
+            try
             {
-                StopRecordingAndTranscribe();
+                if (_sttEnabled && _isRecording)
+                {
+                    StopRecordingAndTranscribe();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[STT] Error during stop/transcribe: {ex.Message}");
+                // Force-reset recording state
+                try { _capture?.StopRecording(); } catch { }
+                _capture?.Dispose();
+                _capture = null;
+                _audioBuffer?.Dispose();
+                _audioBuffer = null;
+                _captureFormat = null;
+                _isRecording = false;
             }
 
+            // Always unmute — never leave speakers muted
             if (_isMuted)
             {
-                Unmute();
+                try { Unmute(); }
+                catch
+                {
+                    // Last resort: force restore volume
+                    RestoreVolume();
+                }
             }
         }
     }
