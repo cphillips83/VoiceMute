@@ -112,7 +112,7 @@ curl -L -o ggml-base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/ma
 ### Requirements
 
 - Linux with a Wayland compositor that supports the [XDG GlobalShortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html) (Hyprland, KDE Plasma)
-- [.NET 10.0 Runtime](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)
+- [.NET 10.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) (or Runtime if using prebuilt binaries)
 - PipeWire (or PulseAudio/ALSA) for audio recording
 - WirePlumber `wpctl` (or PulseAudio `pactl`) for volume control
 - `ydotool` + `ydotoold` for text injection
@@ -136,18 +136,24 @@ VoiceMute.Linux --kill                   Stop background daemon
 
 ```bash
 # Arch/CachyOS
-sudo pacman -S cuda cudnn ffmpeg ydotool cmake
+sudo pacman -S dotnet-sdk cuda cudnn ffmpeg ydotool cmake xdg-desktop-portal-hyprland
+```
 
-# Start ydotoold (system service, needs /dev/uinput access)
-# Create /etc/systemd/system/ydotoold.service:
-# [Unit]
-# Description=ydotool virtual input daemon
-# [Service]
-# ExecStart=/usr/bin/ydotoold
-# ExecStartPost=/bin/bash -c 'for i in $(seq 1 10); do [ -S /tmp/.ydotool_socket ] && chmod 666 /tmp/.ydotool_socket && break; sleep 0.1; done'
-# [Install]
-# WantedBy=multi-user.target
+Set up ydotoold as a system service (needs `/dev/uinput` access). Create `/etc/systemd/system/ydotoold.service`:
 
+```ini
+[Unit]
+Description=ydotool virtual input daemon
+
+[Service]
+ExecStart=/usr/bin/ydotoold
+ExecStartPost=/bin/bash -c 'for i in $(seq 1 10); do [ -S /tmp/.ydotool_socket ] && chmod 666 /tmp/.ydotool_socket && break; sleep 0.1; done'
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
 sudo systemctl enable --now ydotoold
 ```
 
